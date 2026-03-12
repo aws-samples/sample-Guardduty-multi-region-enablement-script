@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'Amazon GuardDuty Multi-Region Configuration - Updates protection plans across regions'
+Description: 'Amazon GuardDuty Multi-Region Configuration - Updates protection plans across regions - (uksb-pn3ldk4qzo)'
 
 Parameters:
   Regions:
