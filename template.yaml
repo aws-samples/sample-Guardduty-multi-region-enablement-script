@@ -1,0 +1,254 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Amazon GuardDuty Multi-Region Configuration - Updates protection plans across regions'
+
+Parameters:
+  Regions:
+    Type: CommaDelimitedList
+    Default: 'us-east-1,us-east-2,us-west-1,us-west-2,af-south-1,ap-east-1,ap-south-1,ap-south-2,ap-northeast-1,ap-northeast-2,ap-northeast-3,ap-southeast-1,ap-southeast-2,ap-southeast-3,ap-southeast-4,ca-central-1,eu-central-1,eu-central-2,eu-west-1,eu-west-2,eu-west-3,eu-north-1,eu-south-1,eu-south-2,il-central-1,me-south-1,me-central-1,sa-east-1'
+    Description: 'Comma-separated list of regions to configure (leave default for all regions)'
+  
+  EnableS3:
+    Type: String
+    Default: 'ENABLED'
+    AllowedValues: ['ENABLED', 'DISABLED']
+    Description: 'S3 data access monitoring'
+  
+  EnableEKS:
+    Type: String
+    Default: 'ENABLED'
+    AllowedValues: ['ENABLED', 'DISABLED']
+    Description: 'EKS audit logs'
+  
+  EnableMalware:
+    Type: String
+    Default: 'ENABLED'
+    AllowedValues: ['ENABLED', 'DISABLED']
+    Description: 'EC2/ECS malware scanning'
+  
+  EnableRDS:
+    Type: String
+    Default: 'ENABLED'
+    AllowedValues: ['ENABLED', 'DISABLED']
+    Description: 'RDS login monitoring'
+  
+  EnableLambda:
+    Type: String
+    Default: 'ENABLED'
+    AllowedValues: ['ENABLED', 'DISABLED']
+    Description: 'Lambda network monitoring'
+  
+  EnableRuntime:
+    Type: String
+    Default: 'ENABLED'
+    AllowedValues: ['ENABLED', 'DISABLED']
+    Description: 'Runtime monitoring (requires sub-features)'
+  
+  EnableEKSRuntime:
+    Type: String
+    Default: 'ENABLED'
+    AllowedValues: ['ENABLED', 'DISABLED']
+    Description: 'EKS runtime monitoring'
+  
+  EnableECSRuntime:
+    Type: String
+    Default: 'ENABLED'
+    AllowedValues: ['ENABLED', 'DISABLED']
+    Description: 'ECS runtime monitoring'
+  
+  EnableEC2Runtime:
+    Type: String
+    Default: 'ENABLED'
+    AllowedValues: ['ENABLED', 'DISABLED']
+    Description: 'EC2 runtime monitoring'
+
+Resources:
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: GuardDutyAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: GuardDutyWildcardRequired
+                Effect: Allow
+                Action:
+                  - guardduty:ListDetectors
+                  - guardduty:CreateDetector
+                  - guardduty:ListMembers
+                  - guardduty:UpdateMemberDetectors
+                Resource: '*'
+              - Sid: GuardDutyDetectorScoped
+                Effect: Allow
+                Action:
+                  - guardduty:UpdateDetector
+                Resource: !Sub 'arn:aws:guardduty:*:${AWS::AccountId}:detector/*'
+              - Sid: IAMServiceLinkedRole
+                Effect: Allow
+                Action:
+                  - iam:GetRole
+                  - iam:CreateServiceLinkedRole
+                Resource: 'arn:aws:iam::*:role/aws-service-role/guardduty.amazonaws.com/*'
+                Condition:
+                  StringEquals:
+                    iam:AWSServiceName: guardduty.amazonaws.com
+
+
+  ConfigureLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import json
+
+          def handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  
+                  import re
+                  ALLOWED_STATUSES = {'ENABLED', 'DISABLED'}
+                  REGION_PATTERN = re.compile(r'^[a-z]{2}-[a-z]+-\d{1}$')
+                  
+                  props = event['ResourceProperties']
+                  regions = [r.strip() for r in props['Regions'].split(',') if r.strip()]
+                  
+                  for r in regions:
+                      if not REGION_PATTERN.match(r):
+                          raise ValueError(f'Invalid region: {r}')
+                  
+                  config = {
+                      's3': props['EnableS3'],
+                      'eks': props['EnableEKS'],
+                      'malware': props['EnableMalware'],
+                      'rds': props['EnableRDS'],
+                      'lambda': props['EnableLambda'],
+                      'runtime': props['EnableRuntime'],
+                      'eks_runtime': props['EnableEKSRuntime'],
+                      'ecs_runtime': props['EnableECSRuntime'],
+                      'ec2_runtime': props['EnableEC2Runtime']
+                  }
+                  
+                  for key, value in config.items():
+                      if value not in ALLOWED_STATUSES:
+                          raise ValueError(f'Invalid status for {key}: {value}')
+                  
+                  results = []
+                  for region in regions:
+                      result = configure_region(region, config)
+                      results.append(result)
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'Results': json.dumps(results)
+                  })
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {
+                      'Error': str(e)
+                  })
+
+          def configure_region(region, config):
+              client = boto3.client('guardduty', region_name=region)
+              
+              try:
+                  detectors = client.list_detectors()
+              except Exception as e:
+                  print(f"Failed to list detectors in {region}: {str(e)}")
+                  raise
+              
+              if not detectors['DetectorIds']:
+                  try:
+                      detector_id = client.create_detector(Enable=True)['DetectorId']
+                  except Exception as e:
+                      print(f"Failed to create detector in {region}: {str(e)}")
+                      raise
+              else:
+                  detector_id = detectors['DetectorIds'][0]
+              
+              features = [
+                  {'Name': 'S3_DATA_EVENTS', 'Status': config['s3']},
+                  {'Name': 'EKS_AUDIT_LOGS', 'Status': config['eks']},
+                  {'Name': 'EBS_MALWARE_PROTECTION', 'Status': config['malware']},
+                  {'Name': 'RDS_LOGIN_EVENTS', 'Status': config['rds']},
+                  {'Name': 'LAMBDA_NETWORK_LOGS', 'Status': config['lambda']},
+                  {
+                      'Name': 'RUNTIME_MONITORING',
+                      'Status': config['runtime'],
+                      'AdditionalConfiguration': [
+                          {'Name': 'EKS_ADDON_MANAGEMENT', 'Status': config['eks_runtime']},
+                          {'Name': 'ECS_FARGATE_AGENT_MANAGEMENT', 'Status': config['ecs_runtime']},
+                          {'Name': 'EC2_AGENT_MANAGEMENT', 'Status': config['ec2_runtime']}
+                      ]
+                  }
+              ]
+              
+              try:
+                  client.update_detector(
+                      DetectorId=detector_id,
+                      FindingPublishingFrequency='FIFTEEN_MINUTES',
+                      Features=features
+                  )
+              except Exception as e:
+                  print(f"Failed to update detector in {region}: {str(e)}")
+                  raise
+              
+              try:
+                  members = client.list_members(DetectorId=detector_id)
+              except Exception as e:
+                  print(f"Failed to list members in {region}: {str(e)}")
+                  raise
+              member_count = 0
+              for member in members.get('Members', []):
+                  if member['RelationshipStatus'] == 'Enabled':
+                      try:
+                          client.update_member_detectors(
+                              DetectorId=detector_id,
+                              AccountIds=[member['AccountId']],
+                              Features=features
+                          )
+                          member_count += 1
+                      except Exception as e:
+                          print(f"Failed to update member {member['AccountId']} in {region}: {str(e)}")
+              
+              return {
+                  'Region': region,
+                  'DetectorId': detector_id,
+                  'MembersUpdated': member_count,
+                  'Status': 'Success'
+              }
+
+  GuardDutyConfiguration:
+    Type: Custom::GuardDutyConfig
+    Properties:
+      ServiceToken: !GetAtt ConfigureLambda.Arn
+      Regions: !Join [',', !Ref Regions]
+      EnableS3: !Ref EnableS3
+      EnableEKS: !Ref EnableEKS
+      EnableMalware: !Ref EnableMalware
+      EnableRDS: !Ref EnableRDS
+      EnableLambda: !Ref EnableLambda
+      EnableRuntime: !Ref EnableRuntime
+      EnableEKSRuntime: !Ref EnableEKSRuntime
+      EnableECSRuntime: !Ref EnableECSRuntime
+      EnableEC2Runtime: !Ref EnableEC2Runtime
+
+Outputs:
+  ConfigurationResults:
+    Description: 'Results of Amazon GuardDuty configuration'
+    Value: !GetAtt GuardDutyConfiguration.Results
